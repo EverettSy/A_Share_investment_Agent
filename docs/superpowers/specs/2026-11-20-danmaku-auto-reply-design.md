@@ -1,0 +1,197 @@
+# 弹幕自动回复设计（星辰 × 播城）
+
+**日期：** 2026-11-20  
+**状态：** 待实现计划（spec 已评审定稿前）  
+**范围：** 基于现有 A（主播端）/ B（播城后端）/ C（星辰平台）时序，增量实现「观众弹幕 → 自动固定话术回复」
+
+## 1. 背景与目标
+
+现有时序仅支持：
+
+1. 星辰开播 → 回调 B 推送直播信息  
+2. A 从 B 拉取直播状态  
+3. A 上行弹幕 → B 调用星辰弹幕接口同步  
+
+该链路是**主播端上行单向同步**，无法完成自动回复。自动回复需要：**观众弹幕入站 → 决策 → 出站发弹幕**。
+
+### 1.1 目标（MVP）
+
+- 星辰通过 Webhook 将观众弹幕推送到 B  
+- B 对弹幕做**关键词精确匹配**，命中后发送**固定话术**  
+- 出站通过可插拔适配器：优先服务端代发；无凭证时降级主播端代发  
+- 具备基础冷却、直播间限流、幂等与审计  
+
+### 1.2 非目标（首期不做）
+
+- LLM / 语义理解生成回复  
+- 模糊匹配、正则、同义词  
+- FAQ 多轮或优先级复杂编排（仅保留简单 priority 字段以备扩展）  
+- 跨平台统一机器人抽象  
+- 礼物 / 进场等非弹幕事件自动回复  
+
+## 2. 已锁定决策
+
+| 议题 | 结论 |
+|------|------|
+| 入站 | 星辰 Webhook 推送观众弹幕（扩展现有回调②，或同入口按 `event_type` 区分） |
+| 出站 | `OutboundAdapter`：`server` / `client` / `auto`（默认 `auto`） |
+| 回复能力 | 关键词精确匹配 → 固定话术 |
+| 逻辑归属 | 决策与风控在 B；A 负责配置与 client 模式代发 |
+
+## 3. 架构
+
+### 3.1 模块
+
+| 模块 | 职责 |
+|------|------|
+| `DanmakuIngress` | 接收星辰 Webhook；验签；按 `event_id` 幂等；落库；异步投递引擎 |
+| `AutoReplyEngine` | 读取直播间配置与规则；精确匹配；冷却/限流；生成待发回复 |
+| `OutboundAdapter` | 统一出站：`ServerSend` 或 `ClientRelay` |
+| `ReplyAuditLog` | 记录触发、跳过、成功、失败原因；可选推给 A |
+
+### 3.2 目标时序
+
+```
+C 开播 ──①──► C
+C ──② 直播信息 Webhook──► B
+A ──③ 拉取状态 / 配置规则──► B
+C ──⑥ 观众弹幕 Webhook──► B (DanmakuIngress)
+B ──⑦ AutoReplyEngine 匹配 + 风控──► 待发回复
+B ──⑤' OutboundAdapter.server──► C   （有凭证）
+  或 B ──任务──► A ──④──► B ──⑤──► C （client 降级）
+B ──⑧ 审计（可选推 A）
+```
+
+步骤④ 保留为**人工弹幕**与 **client 代发**通道；自动回复在 `server` 模式下不依赖 A 在线。
+
+## 4. 入站：Webhook
+
+### 4.1 约定字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `event_id` | string | 全局唯一；幂等键；必填 |
+| `event_type` | string | 例：`live.start`、`danmaku.message` |
+| `room_id` | string | 星辰直播间 ID，映射播城场次 |
+| `user_id` | string | 观众平台 UID |
+| `nickname` | string | 可选，审计展示 |
+| `content` | string | 弹幕原文 |
+| `ts` | int64 | 平台毫秒/秒时间戳；与 B 时钟差超过阈值（默认 5 分钟）则丢弃并记审计 |
+| `sign` | string | 按星辰约定验签（如 HMAC-SHA256 over body + timestamp） |
+
+字段名若与星辰文档不一致，以星辰文档为准，B 侧做适配映射；语义不变。
+
+### 4.2 处理原则
+
+1. 验签失败：HTTP 401，不落库  
+2. 重复 `event_id`：HTTP 200，不重复投递引擎  
+3. 未知 `event_type`：HTTP 200，忽略业务  
+4. 合法弹幕事件：先持久化再 HTTP 200，异步调用引擎（避免回调超时）  
+5. 仅处理已映射且「开播中」的 `room_id`；否则记 `skipped: not_live`  
+
+## 5. 规则与匹配
+
+### 5.1 数据模型
+
+**auto_reply_config**（每直播间或每主播一条）
+
+| 字段 | 说明 | 默认 |
+|------|------|------|
+| `room_id` / `streamer_id` | 作用域 | — |
+| `enabled` | 总开关 | `false` |
+| `cooldown_user_sec` | 同用户冷却 | `60` |
+| `cooldown_room_qps` | 直播间出站上限 | `1` 条/秒 |
+| `outbound_mode` | `server` \| `client` \| `auto` | `auto` |
+
+**auto_reply_rule**
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 规则 ID |
+| `room_id` | 所属直播间 |
+| `keyword` | 精确匹配关键词 |
+| `reply` | 固定话术 |
+| `priority` | 整数，越大优先；同 priority 取 `id` 较小者 |
+| `enabled` | 是否启用 |
+
+配置由 A 经 B 的管理 API 维护（CRUD + 开关）；变更立即对后续事件生效（进程内缓存 TTL ≤ 5s 可接受）。
+
+### 5.2 匹配算法（确定性）
+
+对 `content`：
+
+1. 若发送方标记为自动回复/主播代发（见 §6.3），**不匹配**（防自回环）  
+2. `normalized = trim(content)`（首期不做全半角折叠；若后续需要须另开变更）  
+3. 在该 `room_id` 下取所有 `enabled=true` 的规则，找 `keyword == normalized`  
+4. 多条命中时取 `priority` 最大的一条；仍并列则取 `id` 最小  
+5. 无命中 → 审计 `skipped: no_match`，不出站  
+
+## 6. 出站：OutboundAdapter
+
+### 6.1 模式
+
+| 模式 | 条件 | 路径 |
+|------|------|------|
+| `server` | 配置为 server，且 B 持有有效发弹幕凭证 | B → C 调用现有弹幕接口⑤ |
+| `client` | 配置为 client，或 auto 降级 | B 写入 `pending_reply`；A 长连接或短轮询领取后走原④⑤ |
+| `auto` | 默认 | 有可用凭证则 `server`，否则 `client` |
+
+「可用凭证」定义：该 `room_id` 在 B 侧存在未过期的星辰发弹幕 token/签名材料，且最近一次探测或实发未返回「权限拒绝」。
+
+### 6.2 client 模式时序
+
+1. 引擎产生待发：`pending_id`, `room_id`, `reply`, `expire_at`（默认 now+15s）  
+2. A 在线则推送；否则等 A 轮询  
+3. A 成功走④⑤后回调 B `ack(pending_id, ok)`  
+4. 超时未 ack：标记 `failed: client_timeout`，**不自动重试**（避免补发刷屏）  
+
+### 6.3 自回环过滤
+
+凡经 `OutboundAdapter` 发出的内容，在本地审计中标记 `outbound=true`，并在调用星辰时尽量带上平台支持的 bot/系统标记。若 Webhook 回推自己的弹幕：优先用平台 `msg_source`/`is_bot` 字段过滤；若无，则用「短时间窗口 + 内容哈希 + room」近似去重（窗口默认 10s）。
+
+## 7. 风控与审计
+
+### 7.1 限流
+
+按顺序检查，任一不通过则不出站：
+
+1. `enabled == false` → `skipped: disabled`  
+2. 房间未开播 → `skipped: not_live`  
+3. 同 `room_id + user_id` 在 `cooldown_user_sec` 内已成功出站过 → `skipped: user_cooldown`  
+4. 房间出站令牌桶超过 `cooldown_room_qps` → `skipped: room_rate_limit`  
+5. 话术未通过播城敏感词校验（若已接入）→ `skipped: sensitive`  
+
+冷却键在**成功出站后**写入；`skipped` 与 `failed` 不延长用户冷却（避免一次失败锁死互动）。`room_rate_limit` 导致的跳过可记指标，不重试该事件。
+
+### 7.2 审计字段
+
+`event_id`, `room_id`, `user_id`, `content`, `rule_id`, `keyword`, `reply`, `outbound_mode`, `status`（`sent` \| `skipped` \| `failed`）, `reason`, `created_at`。
+
+主播端可选拉取最近 N 条审计，用于观察自动回复是否正常。
+
+## 8. 错误处理与可运维性
+
+- 星辰发弹幕 5xx / 超时：记 `failed: upstream`，该事件不重试；凭证类 401/403：若模式为 `auto`，将该 room 暂时降级为 `client`（降级缓存默认 5 分钟）  
+- Ingress 与引擎解耦：引擎堆积时只影响回复延迟，不影响 Webhook ACK  
+- 关键指标：入站 QPS、匹配率、出站成功率、client 超时率、降级次数  
+
+## 9. 测试要点
+
+1. 重复 `event_id` 只处理一次  
+2. `trim` 后精确命中；前后空格不影响；子串不命中（「你好呀」不等于「你好」）  
+3. 用户冷却与房间 QPS 行为符合默认值  
+4. `server` 成功路径；无凭证时 `auto` → `client`；client 超时不重试  
+5. 自回环：模拟 Webhook 回推刚发出的回复，不再二次回复  
+6. `enabled=false` 与未开播均不出站  
+
+## 10. 实现边界说明
+
+本设计描述播城 B/A 与星辰 C 的集成契约与 B 侧模块职责。当前仓库若尚未包含播城服务代码，实现阶段需在对应服务仓库落地；本 spec 作为跨端契约与验收基准。
+
+## 11. 开放依赖（不阻塞写实现计划，但阻塞联调）
+
+以下为外部平台事实，实现时用适配层承接，**不改变本 spec 语义**：
+
+1. 星辰 Webhook 最终字段名与验签算法以官方文档为准  
+2. 发弹幕 API 的鉴权头/body 以官方文档为准  
+3. 平台是否回推机器人自身弹幕、是否有 `is_bot` 字段——决定自回环过滤走主键还是近似去重  
