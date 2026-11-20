@@ -49,21 +49,74 @@
 | `OutboundAdapter` | 统一出站：`ServerSend` 或 `ClientRelay` |
 | `ReplyAuditLog` | 记录触发、跳过、成功、失败原因；可选推给 A |
 
-### 3.2 目标时序
+### 3.2 最终版时序图
 
+参与方与原稿一致：A 播城主播端 · B 播城后端 · C 星辰平台。  
+①–③、⑤ 沿用；④ 保留为人工/client 代发；**新增 ⑥ 入站、⑦ 决策、⑧ 审计**；自动回复出站为 ⑤'（server）或 ④→⑤（client）。
+
+#### 主路径（outbound_mode = server | auto 且有凭证）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as A · 播城主播端
+    participant B as B · 播城后端
+    participant C as C · 星辰平台
+
+    Note over C: ① 平台开播
+    C->>B: ② 推送直播信息（Webhook）
+    Note right of B: B 提供回调接口<br/>event_type=live.start
+    A->>B: ③ 获取 C 的直播信息 / 配置自动回复规则
+    Note right of A: 拉取直播状态 · 维护关键词话术
+
+    C->>B: ⑥ 推送观众弹幕（Webhook）
+    Note right of B: DanmakuIngress<br/>验签 · event_id 幂等 · 快速 ACK
+    B->>B: ⑦ AutoReplyEngine<br/>精确匹配关键词 + 冷却/QPS
+    alt 命中且通过风控
+        B->>C: ⑤' 调用 C 平台弹幕接口（同步自动回复）
+        Note right of B: OutboundAdapter.server<br/>不依赖 A 在线
+        B-->>A: ⑧ 可选：推送审计日志
+    else 未命中 / 冷却 / 未开启
+        B->>B: ⑧ 审计 skipped（不出站）
+    end
 ```
-C 开播 ──①──► C
-C ──② 直播信息 Webhook──► B
-A ──③ 拉取状态 / 配置规则──► B
-C ──⑥ 观众弹幕 Webhook──► B (DanmakuIngress)
-B ──⑦ AutoReplyEngine 匹配 + 风控──► 待发回复
-B ──⑤' OutboundAdapter.server──► C   （有凭证）
-  或 B ──任务──► A ──④──► B ──⑤──► C （client 降级）
-B ──⑧ 审计（可选推 A）
+
+#### 降级路径（outbound_mode = client，或 auto 无凭证）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as A · 播城主播端
+    participant B as B · 播城后端
+    participant C as C · 星辰平台
+
+    C->>B: ⑥ 推送观众弹幕（Webhook）
+    B->>B: ⑦ 精确匹配 + 风控 → 生成 pending_reply
+    B-->>A: 下发待发任务（推送或轮询领取）
+    alt A 在线且 15s 内领取
+        A->>B: ④ 发送弹幕（主播端上行，承载自动回复话术）
+        B->>C: ⑤ 调用 C 平台弹幕接口
+        A->>B: ack(pending_id, ok)
+        B->>B: ⑧ 审计 sent
+    else 超时未领取
+        B->>B: ⑧ 审计 failed: client_timeout（不重试）
+    end
 ```
 
-步骤④ 保留为**人工弹幕**与 **client 代发**通道；自动回复在 `server` 模式下不依赖 A 在线。
+#### 步骤对照（相对原图）
 
+| 步骤 | 方向 | 动作 | 相对原图 |
+|------|------|------|----------|
+| ① | C | 平台开播 | 沿用 |
+| ② | C→B | 推送直播信息 | 沿用（可按 event_type 扩展） |
+| ③ | A→B | 拉取直播状态 / 配置规则 | 扩展 |
+| ⑥ | C→B | 推送观众弹幕 | **新增（关键）** |
+| ⑦ | B | 匹配 + 风控 | **新增** |
+| ⑤' | B→C | 服务端代发自动回复 | 复用⑤ |
+| ④→⑤ | A→B→C | client 降级代发 | 沿用④⑤语义 |
+| ⑧ | B（→A） | 审计日志 | **新增** |
+
+步骤④ 同时用于**人工弹幕**与 **client 代发**；`server` 模式下自动回复不依赖 A 在线。
 ## 4. 入站：Webhook
 
 ### 4.1 约定字段
