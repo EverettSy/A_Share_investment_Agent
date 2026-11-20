@@ -1,53 +1,83 @@
-# 弹幕自动回复 · 最终版时序图
+# 弹幕自动回复 · 最终版时序图（代理商身份）
 
-> 与 Spec `2026-11-20-danmaku-auto-reply-design.md` §3.2 一致。  
-> 参与方：A 播城主播端 · B 播城后端 · C 星辰平台
+> 依据：[弹幕 HTTP 对接文档](https://docs.apipost.net/docs/detail/732230de0472000?locale=zh-cn&target_id=32229200b12005)  
+> 身份：**代理商** = 监听服务；**平台** = 文档「我方服务器」；**源直播间** = `live_url`（如抖音）
 
-## 主路径（server / auto 有凭证）
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as A · 播城主播端
-    participant B as B · 播城后端
-    participant C as C · 星辰平台
-
-    Note over C: ① 平台开播
-    C->>B: ② 推送直播信息（Webhook）
-    Note right of B: B 提供回调接口<br/>event_type=live.start
-    A->>B: ③ 获取 C 的直播信息 / 配置自动回复规则
-    Note right of A: 拉取直播状态 · 维护关键词话术
-
-    C->>B: ⑥ 推送观众弹幕（Webhook）
-    Note right of B: DanmakuIngress<br/>验签 · event_id 幂等 · 快速 ACK
-    B->>B: ⑦ AutoReplyEngine<br/>精确匹配关键词 + 冷却/QPS
-    alt 命中且通过风控
-        B->>C: ⑤' 调用 C 平台弹幕接口（同步自动回复）
-        Note right of B: OutboundAdapter.server<br/>不依赖 A 在线
-        B-->>A: ⑧ 可选：推送审计日志
-    else 未命中 / 冷却 / 未开启
-        B->>B: ⑧ 审计 skipped（不出站）
-    end
-```
-
-## 降级路径（client / auto 无凭证）
+## 文档既有对接流程（无自动回复）
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant A as A · 播城主播端
-    participant B as B · 播城后端
-    participant C as C · 星辰平台
+    participant U as 用户/主播
+    participant P as 平台服务器
+    participant G as 代理商监听服务
+    participant S as 源直播间
 
-    C->>B: ⑥ 推送观众弹幕（Webhook）
-    B->>B: ⑦ 精确匹配 + 风控 → 生成 pending_reply
-    B-->>A: 下发待发任务（推送或轮询领取）
-    alt A 在线且 15s 内领取
-        A->>B: ④ 发送弹幕（主播端上行，承载自动回复话术）
-        B->>C: ⑤ 调用 C 平台弹幕接口
-        A->>B: ack(pending_id, ok)
-        B->>B: ⑧ 审计 sent
-    else 超时未领取
-        B->>B: ⑧ 审计 failed: client_timeout（不重试）
+    U->>P: 开播
+    P->>G: POST /api/open/tasks<br/>live_auth_code, live_url
+    G->>S: 建立监听
+    G-->>P: code=1 监听成功
+
+    loop 收到弹幕
+        S-->>G: 观众弹幕/事件
+        G->>P: POST /api/partner/danmaku/comments<br/>comments[]（msg/come/…）
+        P-->>G: code=1 已接收
+    end
+
+    opt 监听异常可重连
+        G->>P: comments msg_type=sys status=-2
+        P-->>G: code=1
+        P->>G: POST /api/open/tasks/reconnect<br/>live_auth_code, request_id
+        G->>S: 重新建立监听
+        G-->>P: code=1 重连成功
+    end
+
+    alt 源站已下播
+        G->>P: comments msg_type=sys status=-1
+        P-->>G: code=1
+    else 用户关播
+        U->>P: 关播
+        P->>G: POST /api/open/tasks/stop
+        G->>S: 停止订阅并清理
+        G-->>P: code=1 停止成功
     end
 ```
+
+## 叠加自动回复（推荐：代理商侧匹配；出站待补齐）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as 平台服务器
+    participant G as 代理商（含 AutoReplyEngine）
+    participant S as 源直播间
+
+    P->>G: POST /api/open/tasks
+    G->>S: 建立监听
+    G-->>P: code=1
+
+    S-->>G: 观众弹幕 message
+    G->>G: 精确匹配关键词 + 冷却/QPS
+    G->>P: POST comments（上报观众弹幕）
+
+    alt 命中规则
+        Note over G,S: 【文档缺口】向源直播间发送回复话术<br/>需另有发弹幕能力
+        G--xS: ⑤' 发送自动回复（待确认）
+        opt 若需让平台可见回复
+            G->>P: POST comments（bot 回复？文档未定义）
+        end
+    else 未命中/冷却
+        G->>G: 审计 skipped
+    end
+```
+
+## 步骤对照
+
+| 步骤 | 方向 | 接口/动作 | 自动回复相关 |
+|------|------|-----------|--------------|
+| 开播任务 | 平台→代理商 | `POST /api/open/tasks` | 会话键 `live_auth_code` |
+| 监听采集 | 源站→代理商 | 代理商自建 | **入站在此发生** |
+| 上报弹幕 | 代理商→平台 | `POST /api/partner/danmaku/comments` | 上报；非回复出站 |
+| 匹配回复 | 代理商内部 | AutoReplyEngine | MVP：精确关键词 |
+| 回源发送 | 代理商→源站 | **文档未提供** | 闭环阻塞点 |
+| 停止/重连 | 双向 | `/tasks/stop` · `/tasks/reconnect` · `sys±1/±2` | 任务生命周期 |
